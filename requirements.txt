@@ -3,6 +3,7 @@
 
 # Core data handling
 pandas>=2.0.0
+pyarrow>=14.0.0
 
 # Web requests for API calls
 requests>=2.31.0

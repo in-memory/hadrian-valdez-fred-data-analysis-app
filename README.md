@@ -6,12 +6,13 @@ A Streamlit-based web application for exploring and visualizing economic data fr
 
 ## 🚀 Features
 
-- **Fetch from FRED API**: Access thousands of economic indicators directly through the official FRED API
-- **Local Caching**: Automatically caches downloaded data in the `data/` directory for faster loading
-- **Interactive Visualizations**: Beautiful line charts using Plotly to track economic trends over time
-- **Flexible Time Horizons**: Choose between 1Y, 5Y, 10Y, or All Available Data views
-- **Raw Data Inspection**: Access underlying data tables with expandable sections
-- **Session Persistence**: Maintains state across app refreshes using Streamlit session management
+- **Bidirectional Category Traversal**: Top-down lazy loading drilldown of FRED category hierarchy combined with bottom-up resolution from any series ID to Root (0)
+- **Browser-Style Navigation**: Back and Forward buttons with session history stacks and clickable breadcrumbs (`Root > Parent > Child`)
+- **Category Tiles & Series Explorer**: Visual category cards, subcategory exploration, and category-level series search
+- **Local Persistence & Flat Adjacency Graph**: Graph caching in `fred_cache.json` and time series datasets in `data/` (`.parquet`, `.csv`, `.json`)
+- **API Safeguards & Defensive Caching**: Automatic local cache lookup before remote FRED API calls, with graceful rate-limit (HTTP 429) prevention
+- **Interactive Visualizations**: High-performance Plotly charts with custom themes, hover tooltips, and time horizon filtering (1Y, 5Y, 10Y, Max)
+- **Economic Metrics & Raw Data Export**: Period delta, percent change, period high/low, raw data inspection, and CSV download
 
 ---
 
@@ -47,11 +48,6 @@ A Streamlit-based web application for exploring and visualizing economic data fr
    FRED_API_KEY=your_api_key_here
    ```
 
-5. **Get your FRED API Key:**
-   - Visit [FRED's API page](https://fred.stlouisfed.org/docs/api/api_key.html)
-   - Sign up and generate a free API key
-   - Copy it into your `.env` file
-
 ---
 
 ## 🎯 Quick Start
@@ -62,43 +58,54 @@ A Streamlit-based web application for exploring and visualizing economic data fr
    ```
 
 2. **In the browser, you'll see:**
-   - A sidebar to select or fetch new series IDs (e.g., `GDP`, `UNRATE`, `CPIAUCSL`)
-   - Time horizon controls (1Y, 5Y, 10Y, Max)
-   - Interactive Plotly charts
-   - Raw data view expander
-
-3. **Try these popular series:**
-   - `CPIAUCSL` - Consumer Price Index, All Urban Consumers
-   - `GDP` - Gross Domestic Product
-   - `UNRATE` - Unemployment Rate
-   - `FEDFUNDS` - Federal Funds Effective Rate
+   - Navigation bar with Back, Forward, Root, and clickable breadcrumbs
+   - Category explorer with subcategory tiles and series filter
+   - Direct series search with bottom-up ancestor resolution in the sidebar
+   - Time horizon controls (1Y, 5Y, 10Y, Max) and interactive Plotly charts
+   - Raw data expander and CSV download
 
 ---
 
-## 📂 Project Structure
+## 📂 Project Structure & Separation of Concerns
 
 ```
 hadrian-valdez-fred-data-analysis-app/
-├── dashboard.py          # Main Streamlit app entry point
-├── data_loader.py        # API interaction and caching logic
+├── dashboard.py          # Presentation layer & Streamlit orchestration
+├── category_manager.py   # Hierarchy traversal engine & fred_cache.json manager
+├── data_loader.py        # FRED API client & raw dataset storage (.parquet/.csv/.json)
+├── fred_cache.json       # Graph adjacency schema cache
 ├── requirements.txt      # Python dependencies
-├── README.md            # This file
-├── .env                  # Your FRED API key (create this)
-└── data/                 # Cached JSON files (created automatically)
+├── README.md             # Project documentation
+├── plan.md               # Technical specification
+├── .env                  # FRED API key credentials
+└── data/                 # Saved dataset observations
+    ├── CPIAUCSL.json
     ├── GDP.json
-    ├── UNRATE.json
+    ├── UNRATE.parquet
     └── ...
 ```
 
 ---
 
-## 🔍 How It Works
+## 🔍 Architecture & How It Works
 
-1. **Input**: User enters a series ID in the sidebar or selects from cached data
-2. **Fetch/Cached Load**: The app checks `data/` for cached JSON files first, then fetches from FRED API if needed
-3. **Process**: Data is parsed, converted to datetime/numeric types, and cleaned
-4. **Visualize**: Plotly creates an interactive line chart with date/time on X-axis and values on Y-axis
-5. **Filter**: Default 10-year view (or user-selected time horizon)
+1. **`dashboard.py`**:
+   - Manages UI session state (`current_category_id`, navigation history stacks, `active_series_id`).
+   - Renders layout: sidebar controls, browser navigation, breadcrumbs, category tiles, series lists, Plotly charts.
+   - *Never directly calls the FRED API or reads/writes cache files directly.*
+
+2. **`category_manager.py`**:
+   - Dedicated exclusively to category logic and graph state.
+   - Manages read/write persistence for `fred_cache.json` using the flat adjacency schema.
+   - Implements top-down lazy-loading category exploration.
+   - Implements bottom-up resolution from `series_id` up to Root (`0`).
+   - Computes lineage breadcrumbs (`Root > Parent > Current`).
+
+3. **`data_loader.py`**:
+   - Dedicated exclusively to FRED network calls and raw dataset file management.
+   - Wraps FRED API endpoints with authentication and rate-limit safeguards.
+   - Manages local `data/` dataset persistence (`.parquet`, `.csv`, `.json`).
+
 
 ---
 
