@@ -116,17 +116,25 @@ def get_category_node(category_id: int, refresh: bool = False, cache_path: str =
             # Root category has no series
             node["series"] = []
         else:
-            series_list = data_loader.fetch_category_series(category_id)
-            if series_list is not None:
+            api_res = data_loader.fetch_category_series(category_id, limit=50)
+            if api_res is not None:
+                series_list = api_res.get("series", []) if isinstance(api_res, dict) else api_res
                 cleaned_series = []
                 for s in series_list:
                     cleaned_series.append({
                         "id": s["id"],
                         "title": s["title"],
                         "frequency": s.get("frequency"),
-                        "units": s.get("units")
+                        "units": s.get("units"),
+                        "seasonal_adjustment": s.get("seasonal_adjustment"),
+                        "last_updated": s.get("last_updated"),
+                        "observation_start": s.get("observation_start"),
+                        "observation_end": s.get("observation_end"),
+                        "popularity": s.get("popularity", 0)
                     })
                 node["series"] = cleaned_series
+                if isinstance(api_res, dict) and "count" in api_res:
+                    node["total_series_count"] = api_res["count"]
             else:
                 node["series"] = []
 
@@ -323,4 +331,228 @@ def get_cache_stats(cache_path: str = CACHE_FILE) -> dict:
         "total_categories": total_categories,
         "visited_categories": visited_categories,
         "total_series_indexed": total_series_indexed
+    }
+
+
+def get_category_series_paginated(
+    category_id: int,
+    page: int = 1,
+    page_size: int = 50,
+    order_by: str = "popularity",
+    sort_order: str = "desc",
+    filter_text: str = "",
+    cache_path: str = CACHE_FILE
+) -> dict:
+    """
+    Retrieves a paginated, sorted list of series for category_id.
+    Standardized to page_size=50 results per page.
+    Calculates offset = (page - 1) * page_size.
+    Returns:
+    {
+        "total_count": int,
+        "page": int,
+        "page_size": int,
+        "total_pages": int,
+        "start_index": int,
+        "end_index": int,
+        "order_by": str,
+        "sort_order": str,
+        "series": list[dict],
+        "is_fallback": bool
+    }
+    """
+    page = max(1, int(page))
+    page_size = 50
+
+    valid_order_by = {
+        "popularity",
+        "last_updated",
+        "observation_end",
+        "observation_start",
+        "title",
+        "frequency",
+        "units",
+        "seasonal_adjustment"
+    }
+    if order_by not in valid_order_by:
+        order_by = "popularity"
+
+    sort_order = sort_order.lower() if sort_order else "desc"
+    if sort_order not in ("asc", "desc"):
+        sort_order = "desc"
+
+    if category_id == 0:
+        return {
+            "total_count": 0,
+            "page": 1,
+            "page_size": page_size,
+            "total_pages": 1,
+            "start_index": 0,
+            "end_index": 0,
+            "order_by": order_by,
+            "sort_order": sort_order,
+            "series": [],
+            "is_fallback": False
+        }
+
+    filter_text = (filter_text or "").strip().lower()
+
+    # If the user is filtering by text, search through category series
+    if filter_text:
+        cache = load_category_cache(cache_path)
+        cat_key = str(category_id)
+        node = cache.get(cat_key)
+
+        # If node has no series or fewer than 50, attempt to fetch a larger batch for searching
+        if not node or not node.get("series") or (len(node.get("series", [])) < 50 and node.get("total_series_count", 0) > len(node.get("series", []))):
+            fetch_res = data_loader.fetch_category_series(category_id, limit=1000, offset=0, order_by=order_by, sort_order=sort_order)
+            if fetch_res and "series" in fetch_res:
+                if not node:
+                    node = {
+                        "id": category_id,
+                        "name": f"Category {category_id}",
+                        "parent_id": None,
+                        "children_ids": None,
+                        "series": []
+                    }
+                    cache[cat_key] = node
+                node["series"] = fetch_res["series"]
+                node["total_series_count"] = fetch_res.get("count", len(fetch_res["series"]))
+                save_category_cache(cache, cache_path)
+
+        all_series = list((node.get("series") if node else []) or [])
+        filtered = [
+            s for s in all_series
+            if filter_text in s.get("id", "").lower() or filter_text in s.get("title", "").lower()
+        ]
+
+        def sort_key_filter(s):
+            val = s.get(order_by)
+            if val is None:
+                return "" if order_by in ("title", "units", "frequency", "seasonal_adjustment") else 0
+            return val
+
+        try:
+            filtered.sort(key=sort_key_filter, reverse=(sort_order == "desc"))
+        except TypeError:
+            filtered.sort(key=lambda s: str(s.get(order_by, "")), reverse=(sort_order == "desc"))
+
+        total_count = len(filtered)
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        clamped_page = max(1, min(page, total_pages))
+        start_index = (clamped_page - 1) * page_size + 1 if total_count > 0 else 0
+        end_index = min(clamped_page * page_size, total_count)
+        page_series = filtered[(clamped_page - 1) * page_size : clamped_page * page_size]
+
+        return {
+            "total_count": total_count,
+            "page": clamped_page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "start_index": start_index,
+            "end_index": end_index,
+            "order_by": order_by,
+            "sort_order": sort_order,
+            "series": page_series,
+            "is_fallback": False
+        }
+
+    # Standard category browsing: Query FRED API directly with limit=50 and offset
+    offset = (page - 1) * page_size
+    api_res = data_loader.fetch_category_series(
+        category_id=category_id,
+        limit=page_size,
+        offset=offset,
+        order_by=order_by,
+        sort_order=sort_order
+    )
+
+    cache = load_category_cache(cache_path)
+    cat_key = str(category_id)
+    node = cache.get(cat_key)
+
+    if api_res is not None:
+        total_count = api_res.get("count", 0)
+        series_items = api_res.get("series", [])
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+
+        # If requested page is out of bounds (e.g. category switch), clamp to total_pages
+        if page > total_pages and total_count > 0:
+            page = total_pages
+            offset = (page - 1) * page_size
+            api_res = data_loader.fetch_category_series(
+                category_id=category_id,
+                limit=page_size,
+                offset=offset,
+                order_by=order_by,
+                sort_order=sort_order
+            )
+            series_items = api_res.get("series", []) if api_res else series_items
+
+        start_index = (page - 1) * page_size + 1 if total_count > 0 else 0
+        end_index = min(page * page_size, total_count)
+
+        if node is None:
+            node = {
+                "id": category_id,
+                "name": f"Category {category_id}",
+                "parent_id": None,
+                "children_ids": None,
+                "series": []
+            }
+            cache[cat_key] = node
+
+        node["total_series_count"] = total_count
+        existing_series = node.get("series") or []
+        existing_map = {s["id"]: s for s in existing_series}
+        for s in series_items:
+            existing_map[s["id"]] = s
+        node["series"] = list(existing_map.values())
+        save_category_cache(cache, cache_path)
+
+        return {
+            "total_count": total_count,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+            "start_index": start_index,
+            "end_index": end_index,
+            "order_by": order_by,
+            "sort_order": sort_order,
+            "series": series_items,
+            "is_fallback": False
+        }
+
+    # Offline / Error Fallback: Use locally cached series
+    cached_series = list((node.get("series") if node else []) or [])
+
+    def sort_key_cached(s):
+        val = s.get(order_by)
+        if val is None:
+            return "" if order_by in ("title", "units", "frequency", "seasonal_adjustment") else 0
+        return val
+
+    try:
+        cached_series.sort(key=sort_key_cached, reverse=(sort_order == "desc"))
+    except TypeError:
+        cached_series.sort(key=lambda s: str(s.get(order_by, "")), reverse=(sort_order == "desc"))
+
+    total_count = len(cached_series)
+    total_pages = max(1, (total_count + page_size - 1) // page_size)
+    clamped_page = max(1, min(page, total_pages))
+    start_index = (clamped_page - 1) * page_size + 1 if total_count > 0 else 0
+    end_index = min(clamped_page * page_size, total_count)
+    page_series = cached_series[(clamped_page - 1) * page_size : clamped_page * page_size]
+
+    return {
+        "total_count": total_count,
+        "page": clamped_page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "start_index": start_index,
+        "end_index": end_index,
+        "order_by": order_by,
+        "sort_order": sort_order,
+        "series": page_series,
+        "is_fallback": True
     }

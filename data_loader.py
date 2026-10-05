@@ -1,6 +1,10 @@
 import glob
 import json
 import os
+import re
+import urllib.request
+from datetime import datetime
+from html import unescape
 import requests
 import pandas as pd
 from dotenv import load_dotenv
@@ -118,12 +122,33 @@ def fetch_category_children(category_id: int) -> list[dict] | None:
     return None
 
 
-def fetch_category_series(category_id: int, limit: int = 1000) -> list[dict] | None:
+def fetch_category_series(
+    category_id: int,
+    limit: int = 50,
+    offset: int = 0,
+    order_by: str = "popularity",
+    sort_order: str = "desc"
+) -> dict | None:
     """
-    Fetches series belonging to a category.
-    Returns: list of {"id": str, "title": str} or None.
+    Fetches series belonging to a category with pagination and multi-attribute sorting.
+    Returns:
+    {
+        "count": int,
+        "offset": int,
+        "limit": int,
+        "order_by": str,
+        "sort_order": str,
+        "series": list[dict]
+    } or None.
     """
-    data = _request_fred("category/series", {"category_id": category_id, "limit": limit})
+    params = {
+        "category_id": category_id,
+        "limit": limit,
+        "offset": offset,
+        "order_by": order_by,
+        "sort_order": sort_order
+    }
+    data = _request_fred("category/series", params)
     if data and "seriess" in data:
         series_list = []
         for s in data["seriess"]:
@@ -132,9 +157,20 @@ def fetch_category_series(category_id: int, limit: int = 1000) -> list[dict] | N
                 "title": str(s.get("title", s.get("id"))),
                 "frequency": s.get("frequency_short", s.get("frequency")),
                 "units": s.get("units_short", s.get("units")),
-                "last_updated": s.get("last_updated")
+                "seasonal_adjustment": s.get("seasonal_adjustment_short", s.get("seasonal_adjustment")),
+                "last_updated": s.get("last_updated"),
+                "observation_start": s.get("observation_start"),
+                "observation_end": s.get("observation_end"),
+                "popularity": s.get("popularity", 0)
             })
-        return series_list
+        return {
+            "count": int(data.get("count", len(series_list))),
+            "offset": int(data.get("offset", offset)),
+            "limit": int(data.get("limit", limit)),
+            "order_by": data.get("order_by", order_by),
+            "sort_order": data.get("sort_order", sort_order),
+            "series": series_list
+        }
     return None
 
 
@@ -167,13 +203,169 @@ def fetch_series_observations(series_id: str) -> list[dict] | None:
     return None
 
 
+def clean_and_format_notes(raw_text: str | None) -> str:
+    """
+    Sanitizes and formats FRED notes string.
+    - Handles raw HTML elements (<p>, <br>, <a>, etc.) cleanly without leaking tags.
+    - Converts hyperlinks (<a href="...">...</a>) to Markdown [text](url).
+    - Unescapes HTML entities (&amp;, &lt;, &gt;, &#39;, &quot;).
+    - Strips dangling/trailing tags (like </p>) and collapses redundant whitespace/newlines.
+    """
+    if not raw_text:
+        return ""
+
+    text = unescape(str(raw_text))
+
+    # 1. Convert <a href="URL">TEXT</a> to Markdown [TEXT](URL)
+    def _link_sub(match):
+        href = match.group(1).strip()
+        label = match.group(2).strip()
+        label = re.sub(r'<[^>]+>', '', label)
+        if not label:
+            label = href
+        return f"[{label}]({href})"
+
+    text = re.sub(
+        r'<a\s+[^>]*?href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        _link_sub,
+        text,
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    # 2. Convert common block breaks (<br>, <p>, </p>, <div>, </div>) into newlines
+    text = re.sub(r'<(?:br\s*/?|/p|p|/div|div)[^>]*>', '\n\n', text, flags=re.IGNORECASE)
+
+    # 3. Format emphasis tags into Markdown
+    text = re.sub(r'<strong[^>]*>(.*?)</strong>', r'**\1**', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<b[^>]*>(.*?)</b>', r'**\1**', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<em[^>]*>(.*?)</em>', r'*\1*', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'<i[^>]*>(.*?)</i>', r'*\1*', text, flags=re.IGNORECASE | re.DOTALL)
+
+    # 4. Strip any remaining or orphaned HTML tags (e.g. </p>, </span>, etc.)
+    text = re.sub(r'<[^>]+>', '', text)
+
+    # 5. Clean up line breaks and spacing
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    lines = [line.strip() for line in text.split('\n')]
+
+    cleaned_lines = []
+    prev_blank = False
+    for line in lines:
+        if line:
+            cleaned_lines.append(line)
+            prev_blank = False
+        elif not prev_blank:
+            cleaned_lines.append("")
+            prev_blank = True
+
+    return '\n'.join(cleaned_lines).strip()
+
+
+def clean_citation(raw_citation: str | None, series_id: str = "", title: str = "") -> str:
+    """
+    Cleans and standardizes the Suggested Citation text.
+    Strips internal HTML, resolves dynamic date placeholders, or generates standard citation if missing.
+    """
+    date_str = datetime.now().strftime("%B %d, %Y")
+    if raw_citation and raw_citation.strip():
+        text = unescape(str(raw_citation))
+        # Replace date span placeholder with current formatted date
+        text = re.sub(r'<span[^>]*class=["\'][^"\']*cit-date[^"\']*["\'][^>]*>.*?</span>', date_str, text, flags=re.IGNORECASE | re.DOTALL)
+        # Strip all HTML tags
+        text = re.sub(r'<[^>]+>', ' ', text)
+        # Normalize whitespace
+        lines = [re.sub(r'\s+', ' ', l).strip() for l in text.split('\n')]
+        lines = [l for l in lines if l]
+        cit = ' '.join(lines)
+        cit = re.sub(r'\s*,\s*,+', ',', cit)
+        if date_str not in cit and "retrieved from FRED" in cit:
+            cit = cit.rstrip('. ,') + f", {date_str}."
+        return cit.strip().rstrip('.') + '.'
+    elif series_id:
+        title_str = title if title else series_id
+        return f"{title_str} [{series_id}], retrieved from FRED, Federal Reserve Bank of St. Louis; https://fred.stlouisfed.org/series/{series_id}, {date_str}."
+    return ""
+
+
+def fetch_series_web_details(series_id: str, timeout: int = 4) -> dict:
+    """
+    Fetches rich metadata directly from the FRED series webpage:
+    - Extracts full un-truncated series notes (including opening definition paragraphs cut off in API).
+    - Extracts the official 'Suggested Citation' block.
+    """
+    url = f"https://fred.stlouisfed.org/series/{series_id.strip().upper()}"
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return {}
+
+    # Extract series notes
+    notes_match = re.search(
+        r'<p\s+class="[^"]*series-notes[^"]*"[^>]*>(.*?)</p>\s*(?:</div>|\s*<div)',
+        html,
+        re.DOTALL | re.IGNORECASE
+    )
+    raw_web_notes = notes_match.group(1).strip() if notes_match else ""
+
+    # Extract citation
+    cit_match = re.search(
+        r'<p\s+class="[^"]*citation[^"]*"[^>]*>(.*?)</p>',
+        html,
+        re.DOTALL | re.IGNORECASE
+    )
+    raw_cit = cit_match.group(1).strip() if cit_match else ""
+
+    return {
+        "notes": clean_and_format_notes(raw_web_notes) if raw_web_notes else "",
+        "citation": clean_citation(raw_cit, series_id=series_id) if raw_cit else ""
+    }
+
+
 def fetch_series_metadata(series_id: str) -> dict | None:
     """
-    Fetches series metadata (title, units, frequency, etc.).
+    Fetches series metadata (title, units, frequency, notes, citation, etc.).
+    Combines FRED API metadata with full web details to ensure complete,
+    un-truncated notes and citation blocks.
     """
     data = _request_fred("series", {"series_id": series_id})
+    meta = None
     if data and "seriess" in data and len(data["seriess"]) > 0:
-        return data["seriess"][0]
+        meta = dict(data["seriess"][0])
+
+    # Fetch web details for complete notes and suggested citation
+    web_details = fetch_series_web_details(series_id)
+
+    if meta is not None:
+        api_notes = clean_and_format_notes(meta.get("notes", ""))
+        web_notes = web_details.get("notes", "")
+
+        # Use web notes if available and more complete (or when API notes is truncated/missing description)
+        if web_notes and (len(web_notes) >= len(api_notes) or api_notes.startswith("announcements") or "</p>" in str(meta.get("notes", ""))):
+            meta["notes"] = web_notes
+        else:
+            meta["notes"] = api_notes if api_notes else web_notes
+
+        # Suggested Citation
+        cit = web_details.get("citation", "")
+        if not cit:
+            cit = clean_citation("", series_id=series_id, title=meta.get("title", ""))
+        meta["citation"] = cit
+        return meta
+
+    elif web_details.get("notes") or web_details.get("citation"):
+        # Fallback if API failed but webpage succeeded
+        return {
+            "id": series_id,
+            "title": series_id,
+            "units": "N/A",
+            "units_short": "N/A",
+            "frequency": "N/A",
+            "notes": web_details.get("notes", ""),
+            "citation": web_details.get("citation", clean_citation("", series_id=series_id))
+        }
+
     return None
 
 
@@ -182,6 +374,83 @@ def fetch_series_metadata(series_id: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 DATA_DIR = "data"
+METADATA_DIR = os.path.join(DATA_DIR, "metadata")
+_SERIES_METADATA_CACHE: dict[str, dict] = {}
+
+
+def get_or_fetch_series_metadata(series_id: str) -> dict:
+    """
+    Retrieves series metadata (title, units, frequency, notes, citation, etc.) with caching.
+    Checks memory cache, then local disk cache (data/metadata/{series_id}.json),
+    then fetches from FRED API + web enrichment.
+    Returns metadata dict, or empty dict if unavailable.
+    """
+    series_id = series_id.strip().upper()
+
+    def _is_cache_invalid(cached_meta: dict) -> bool:
+        if not cached_meta or not isinstance(cached_meta, dict):
+            return True
+        notes = str(cached_meta.get("notes", ""))
+        # Invalidate if notes has raw HTML tags, starts mid-sentence with announcements, or lacks citation
+        if "</p>" in notes or "<p" in notes or notes.strip().startswith("announcements ("):
+            return True
+        if not cached_meta.get("citation"):
+            return True
+        return False
+
+    # 1. In-memory cache
+    if series_id in _SERIES_METADATA_CACHE:
+        cached = _SERIES_METADATA_CACHE[series_id]
+        if not _is_cache_invalid(cached):
+            return cached
+
+    # 2. Local disk cache
+    os.makedirs(METADATA_DIR, exist_ok=True)
+    meta_path = os.path.join(METADATA_DIR, f"{series_id}.json")
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict) and meta and not _is_cache_invalid(meta):
+                _SERIES_METADATA_CACHE[series_id] = meta
+                return meta
+        except Exception as e:
+            print(f"Error reading metadata cache for {series_id}: {e}")
+
+    # 3. FRED API network call + enrichment
+    meta = fetch_series_metadata(series_id)
+    if meta and isinstance(meta, dict):
+        meta["notes"] = clean_and_format_notes(meta.get("notes", ""))
+        if not meta.get("citation"):
+            meta["citation"] = clean_citation("", series_id=series_id, title=meta.get("title", ""))
+        _SERIES_METADATA_CACHE[series_id] = meta
+        try:
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+        except Exception as e:
+            print(f"Error saving metadata cache for {series_id}: {e}")
+        return meta
+
+    # 4. Fallback: check if local observations JSON exists with some basic keys
+    json_path = os.path.join(DATA_DIR, f"{series_id}.json")
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            fallback = {
+                "id": series_id,
+                "title": series_id,
+                "units": data.get("units", "N/A"),
+                "units_short": data.get("units", "N/A"),
+                "frequency": "N/A",
+                "notes": "",
+                "citation": clean_citation("", series_id=series_id)
+            }
+            return fallback
+        except Exception:
+            pass
+
+    return {}
 
 
 def list_cached_series_ids() -> list[str]:
@@ -196,8 +465,8 @@ def list_cached_series_ids() -> list[str]:
     for ext in ("*.parquet", "*.csv", "*.json"):
         for file_path in glob.glob(os.path.join(DATA_DIR, ext)):
             base = os.path.basename(file_path)
-            # Exclude category cache or non-series files
-            if base in ("fred_cache.json", "categories"):
+            # Exclude category cache, metadata dir, or non-series files
+            if base in ("fred_cache.json", "categories", "metadata") or os.path.isdir(file_path):
                 continue
             series_name = os.path.splitext(base)[0]
             if series_name:

@@ -47,6 +47,11 @@ st.markdown("""
         color: #38bdf8;
         margin-top: 2px;
     }
+    [data-testid="stMetricValue"] {
+        font-size: 1.45rem !important;
+        font-weight: 600;
+        overflow-wrap: break-word;
+    }
     .crumb-bar {
         display: flex;
         align-items: center;
@@ -92,6 +97,63 @@ PLACEHOLDER_SAVED_DATASET = "-- Select Saved Dataset --"
 VIEW_EXPLORER = "📂 Category Explorer & Series"
 VIEW_VISUALIZER = "📈 Series Visualization"
 
+SORT_OPTIONS = {
+    "Popularity": "popularity",
+    "Last Updated": "last_updated",
+    "Observation End": "observation_end",
+    "Observation Start": "observation_start",
+    "Title": "title",
+    "Frequency": "frequency",
+    "Units": "units",
+    "Seasonal Adjustment": "seasonal_adjustment",
+}
+SORT_LABEL_FROM_KEY = {v: k for k, v in SORT_OPTIONS.items()}
+
+SORT_ORDERS = {
+    "⬇️ Descending": "desc",
+    "⬆️ Ascending": "asc",
+}
+SORT_ORDER_LABEL_FROM_KEY = {v: k for k, v in SORT_ORDERS.items()}
+
+
+def render_pagination_bar(curr_id: int, total_count: int, current_page: int, total_pages: int, start_idx: int, end_idx: int, location: str = "top"):
+    range_str = f"Displaying **{start_idx}–{end_idx}** of **{total_count:,}** datasets" if total_count > 0 else "Displaying **0 of 0** datasets"
+
+    col_range, col_prev, col_status, col_next, col_jump = st.columns([3.8, 1.4, 1.8, 1.4, 1.6])
+
+    with col_range:
+        st.markdown(f"<div style='padding-top: 6px; color: #94a3b8; font-size: 0.92rem;'>{range_str}</div>", unsafe_allow_html=True)
+
+    with col_prev:
+        can_prev = current_page > 1
+        if st.button("⬅️ Prev", key=f"btn_prev_{location}_{curr_id}", disabled=not can_prev, width="stretch"):
+            st.session_state.category_page = current_page - 1
+            st.rerun()
+
+    with col_status:
+        st.markdown(f"<div style='text-align: center; padding-top: 6px; font-weight: 600; color: #e2e8f0; font-size: 0.9rem;'>Page {current_page} of {total_pages}</div>", unsafe_allow_html=True)
+
+    with col_next:
+        can_next = current_page < total_pages
+        if st.button("Next ➡️", key=f"btn_next_{location}_{curr_id}", disabled=not can_next, width="stretch"):
+            st.session_state.category_page = current_page + 1
+            st.rerun()
+
+    with col_jump:
+        if total_pages > 1:
+            jump_options = list(range(1, total_pages + 1))
+            current_jump_idx = current_page - 1 if current_page <= total_pages else 0
+            selected_page = st.selectbox(
+                "Jump to page",
+                options=jump_options,
+                index=current_jump_idx,
+                key=f"jump_{location}_{curr_id}_{current_page}",
+                label_visibility="collapsed"
+            )
+            if selected_page != current_page:
+                st.session_state.category_page = selected_page
+                st.rerun()
+
 
 # ---------------------------------------------------------------------------
 # State Management & Navigation Functions
@@ -132,6 +194,18 @@ def init_session_state():
 
     if "series_search_filter" not in st.session_state:
         st.session_state.series_search_filter = ""
+
+    if "category_sort_by" not in st.session_state:
+        st.session_state.category_sort_by = "popularity"
+
+    if "category_sort_order" not in st.session_state:
+        st.session_state.category_sort_order = "desc"
+
+    if "category_page" not in st.session_state:
+        st.session_state.category_page = 1
+
+    if "last_filter_query" not in st.session_state:
+        st.session_state.last_filter_query = ""
 
 
 def select_series(series_id: str, switch_to_visualizer: bool = True, resolve_category: bool = False):
@@ -240,21 +314,18 @@ def main():
         cached_series_list = data_loader.list_cached_series_ids()
         dropdown_options = [PLACEHOLDER_SAVED_DATASET] + cached_series_list
 
-        # Ensure session state for dropdown index is valid
+        # Ensure session state for saved_datasets_select is valid
         active_series = st.session_state.active_series_id
         if active_series in cached_series_list:
-            expected_index = cached_series_list.index(active_series) + 1
-            st.session_state.saved_datasets_select = active_series
+            expected_val = active_series
         else:
-            expected_index = 0
-            st.session_state.saved_datasets_select = PLACEHOLDER_SAVED_DATASET
-
-        st.session_state.cached_series_dropdown_index = expected_index
+            expected_val = PLACEHOLDER_SAVED_DATASET
+        if st.session_state.get("saved_datasets_select") != expected_val:
+            st.session_state.saved_datasets_select = expected_val
 
         st.selectbox(
             "Load from Local Cache",
             options=dropdown_options,
-            index=st.session_state.cached_series_dropdown_index,
             key="saved_datasets_select",
             on_change=on_dropdown_select
         )
@@ -324,7 +395,6 @@ def main():
         view_selection = st.segmented_control(
             "View Mode",
             options=[VIEW_EXPLORER, VIEW_VISUALIZER],
-            default=st.session_state.view_selector,
             key="view_selector"
         )
         if view_selection and view_selection != st.session_state.active_view:
@@ -334,10 +404,13 @@ def main():
     with view_col2:
         curr_active = st.session_state.active_series_id
         is_cached_marker = "⚡ Cached" if data_loader.is_series_cached(curr_active) else "☁️ Remote"
+        fred_url = f"https://fred.stlouisfed.org/series/{curr_active}"
         st.markdown(
-            f"<div style='text-align: right; padding-top: 6px; color: #94a3b8;'>"
-            f"Active Series: <strong style='color:#38bdf8;'>{curr_active}</strong> &nbsp; "
+            f"<div style='text-align: right; padding-top: 6px; color: #94a3b8; display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap;'>"
+            f"<span>Active Series: <strong style='color:#38bdf8;'>{curr_active}</strong></span>"
             f"<span style='font-size: 0.8rem; background: rgba(56, 189, 248, 0.15); padding: 3px 8px; border-radius: 6px;'>{is_cached_marker}</span>"
+            f"<a href='{fred_url}' target='_blank' rel='noopener noreferrer' style='color: #38bdf8; text-decoration: none; font-size: 0.82rem; font-weight: 500; background: rgba(56, 189, 248, 0.1); border: 1px solid rgba(56, 189, 248, 0.3); padding: 3px 8px; border-radius: 6px; display: inline-flex; align-items: center; gap: 4px;' title='View {curr_active} on official FRED website'>"
+            f"↗ View on FRED</a>"
             f"</div>",
             unsafe_allow_html=True
         )
@@ -382,58 +455,145 @@ def main():
         st.markdown("---")
 
         # Section 2: Series in this Category
-        st.markdown(f"##### Available Series in '{cat_name}' ({len(series_items)} found)")
-
-        if series_items:
-            # Filter bar for series
-            search_query = st.text_input(
-                "Filter series in this category",
-                placeholder="Search by title or series ID (e.g. CPI, Percent, Monthly)...",
-                key="series_filter_input"
-            ).strip().lower()
-
-            filtered_series = [
-                s for s in series_items
-                if search_query in s["id"].lower() or search_query in s["title"].lower()
-            ] if search_query else series_items
-
-            st.caption(f"Showing {min(len(filtered_series), 50)} of {len(filtered_series)} matching series")
-
-            # Series Table / Selection list
-            displayed_items = filtered_series[:50]
-
-            for s in displayed_items:
-                s_id = s["id"]
-                s_title = s["title"]
-                is_cached = data_loader.is_series_cached(s_id)
-                is_active = (s_id == st.session_state.active_series_id)
-
-                row_col1, row_col2, row_col3 = st.columns([1.5, 6, 2])
-                with row_col1:
-                    badge = "⚡ Cached" if is_cached else "☁️ Remote"
-                    active_marker = "👉 " if is_active else ""
-                    st.markdown(f"**{active_marker}`{s_id}`** &nbsp; `{badge}`")
-                with row_col2:
-                    st.write(s_title)
-                with row_col3:
-                    btn_text = "📊 View Active Chart" if is_active else "📈 View Chart"
-                    if st.button(
-                        btn_text,
-                        key=f"view_series_{s_id}",
-                        type="primary" if is_active else "secondary",
-                        width="stretch"
-                    ):
-                        select_series(s_id, switch_to_visualizer=True)
-                        st.rerun()
-                st.markdown("<hr style='margin: 4px 0; border: none; border-bottom: 1px solid rgba(255,255,255,0.06);'>", unsafe_allow_html=True)
-
-            if len(filtered_series) > 50:
-                st.info(f"Showing first 50 of {len(filtered_series)} series. Use the filter bar to refine your search.")
+        if curr_id == 0:
+            st.markdown("---")
+            st.info("💡 **Root Categories:** Select a top-level category tile above to browse economic series and datasets.")
         else:
-            if curr_id == 0:
-                st.write("Root category contains top-level sectors. Click a subcategory tile above to explore series.")
+            st.markdown("---")
+            st.markdown(f"##### Available Series in '{cat_name}'")
+
+            # Search filter, sorting attribute, and sorting direction controls
+            filter_col, sort_by_col, sort_dir_col = st.columns([4.5, 3.2, 2.3])
+
+            with filter_col:
+                search_query = st.text_input(
+                    "Filter series in this category",
+                    placeholder="Search by title or series ID (e.g. CPI, Percent, Monthly)...",
+                    key="series_filter_input"
+                ).strip()
+
+            with sort_by_col:
+                current_sort_label = SORT_LABEL_FROM_KEY.get(st.session_state.category_sort_by, "Popularity")
+                sort_options_keys = list(SORT_OPTIONS.keys())
+                chosen_sort_label = st.selectbox(
+                    "Sort Attribute",
+                    options=sort_options_keys,
+                    index=sort_options_keys.index(current_sort_label),
+                    key=f"sort_by_select_{curr_id}"
+                )
+                chosen_sort_by = SORT_OPTIONS[chosen_sort_label]
+
+            with sort_dir_col:
+                current_dir_label = SORT_ORDER_LABEL_FROM_KEY.get(st.session_state.category_sort_order, "⬇️ Descending")
+                dir_options_keys = list(SORT_ORDERS.keys())
+                chosen_dir_label = st.selectbox(
+                    "Order",
+                    options=dir_options_keys,
+                    index=dir_options_keys.index(current_dir_label),
+                    key=f"sort_dir_select_{curr_id}"
+                )
+                chosen_sort_order = SORT_ORDERS[chosen_dir_label]
+
+            # Requirement 2: Reset the current page index back to Page 1 whenever a user updates the sort attribute or direction
+            if chosen_sort_by != st.session_state.category_sort_by or chosen_sort_order != st.session_state.category_sort_order:
+                st.session_state.category_sort_by = chosen_sort_by
+                st.session_state.category_sort_order = chosen_sort_order
+                st.session_state.category_page = 1
+                st.rerun()
+
+            # Reset page to 1 if filter query changed
+            if search_query != st.session_state.last_filter_query:
+                st.session_state.last_filter_query = search_query
+                st.session_state.category_page = 1
+                st.rerun()
+
+            # Requirement 3: Display a loading state or spinner while fetching subsequent pages
+            with st.spinner("Fetching datasets from FRED..."):
+                page_data = category_manager.get_category_series_paginated(
+                    category_id=curr_id,
+                    page=st.session_state.category_page,
+                    page_size=50,
+                    order_by=st.session_state.category_sort_by,
+                    sort_order=st.session_state.category_sort_order,
+                    filter_text=search_query
+                )
+
+            total_count = page_data["total_count"]
+            current_page = page_data["page"]
+            total_pages = page_data["total_pages"]
+            start_idx = page_data["start_index"]
+            end_idx = page_data["end_index"]
+            series_items = page_data["series"]
+            is_fallback = page_data.get("is_fallback", False)
+
+            # Sync active page state
+            st.session_state.category_page = current_page
+
+            if is_fallback:
+                st.info("ℹ️ Displaying locally cached series data.")
+
+            if total_count > 0:
+                render_pagination_bar(curr_id, total_count, current_page, total_pages, start_idx, end_idx, location="top")
+                st.markdown("<div style='margin-bottom: 12px;'></div>", unsafe_allow_html=True)
+
+                for s in series_items:
+                    s_id = s["id"]
+                    s_title = s["title"]
+                    is_cached = data_loader.is_series_cached(s_id)
+                    is_active = (s_id == st.session_state.active_series_id)
+
+                    row_col1, row_col2, row_col3 = st.columns([1.8, 6.2, 2.0])
+                    with row_col1:
+                        badge = "⚡ Cached" if is_cached else "☁️ Remote"
+                        active_marker = "👉 " if is_active else ""
+                        st.markdown(f"**{active_marker}`{s_id}`** &nbsp; `{badge}`")
+                        pop_val = s.get("popularity")
+                        if pop_val is not None:
+                            st.caption(f"🔥 Popularity: **{pop_val}**")
+                    with row_col2:
+                        st.markdown(f"<div style='font-size: 1rem; font-weight: 500; color: #f8fafc;'>{s_title}</div>", unsafe_allow_html=True)
+                        meta_parts = []
+                        if s.get("units"):
+                            meta_parts.append(f"Units: {s['units']}")
+                        if s.get("frequency"):
+                            meta_parts.append(f"Freq: {s['frequency']}")
+                        if s.get("seasonal_adjustment"):
+                            meta_parts.append(f"Adj: {s['seasonal_adjustment']}")
+                        if s.get("last_updated"):
+                            updated_date = str(s["last_updated"]).split(" ")[0]
+                            meta_parts.append(f"Updated: {updated_date}")
+                        if s.get("observation_start") and s.get("observation_end"):
+                            meta_parts.append(f"Span: {s['observation_start']} to {s['observation_end']}")
+                        if meta_parts:
+                            st.markdown(f"<div style='font-size: 0.8rem; color: #94a3b8; margin-top: 3px;'>{' &bull; '.join(meta_parts)}</div>", unsafe_allow_html=True)
+                    with row_col3:
+                        btn_text = "📊 View Active Chart" if is_active else "📈 View Chart"
+                        if st.button(
+                            btn_text,
+                            key=f"view_series_{s_id}_{current_page}",
+                            type="primary" if is_active else "secondary",
+                            width="stretch"
+                        ):
+                            select_series(s_id, switch_to_visualizer=True)
+                            st.rerun()
+
+                        s_fred_url = f"https://fred.stlouisfed.org/series/{s_id}"
+                        st.markdown(
+                            f"<div style='text-align: center; margin-top: 3px;'>"
+                            f"<a href='{s_fred_url}' target='_blank' rel='noopener noreferrer' style='color: #38bdf8; font-size: 0.8rem; text-decoration: none;' title='Open {s_id} on official FRED website'>"
+                            f"View on FRED ↗</a></div>",
+                            unsafe_allow_html=True
+                        )
+                    st.markdown("<hr style='margin: 6px 0; border: none; border-bottom: 1px solid rgba(255,255,255,0.06);'>", unsafe_allow_html=True)
+
+                if total_pages > 1:
+                    st.markdown("<div style='margin-top: 14px;'></div>", unsafe_allow_html=True)
+                    render_pagination_bar(curr_id, total_count, current_page, total_pages, start_idx, end_idx, location="bottom")
             else:
-                st.write("No series directly associated with this category. Please check its subcategories.")
+                if search_query:
+                    st.warning(f"No series matching '{search_query}' found in this category.")
+                else:
+                    st.info("No series directly associated with this category. Please check its subcategories.")
 
     # -----------------------------------------------------------------------
     # VIEW 2: Series Visualization & Analysis
@@ -454,10 +614,14 @@ def main():
         is_cached_now = data_loader.is_series_cached(active_id)
         cache_badge = "⚡ Stored Locally" if is_cached_now else "☁️ Fetched from FRED"
 
-        header_col, action_col, horizon_col = st.columns([5, 2, 3])
+        header_col, link_col, action_col, horizon_col = st.columns([4.2, 1.8, 1.8, 2.2])
         with header_col:
             st.subheader(f"Active Series: `{active_id}`")
             st.caption(f"Status: **{cache_badge}** | Total Observations: **{len(df):,}**")
+
+        with link_col:
+            fred_url = f"https://fred.stlouisfed.org/series/{active_id}"
+            st.link_button("↗️ View on FRED", url=fred_url, width="stretch", help=f"Open {active_id} on official FRED website")
 
         with action_col:
             if st.button("📂 Back to Explorer", width="stretch"):
@@ -474,6 +638,8 @@ def main():
             )
             if time_frame:
                 st.session_state.time_horizon = time_frame
+            else:
+                time_frame = st.session_state.time_horizon
 
         # Filter by horizon
         max_date = df["date"].max()
@@ -488,27 +654,29 @@ def main():
 
         filtered_df = df[df["date"] >= start_date].copy()
 
-        # Summary Metrics
+        # Retrieve Series Metadata
+        meta = data_loader.get_or_fetch_series_metadata(active_id)
+
+        # -------------------------------------------------------------------
+        # Summary Metrics (Units, Frequency, Time Horizon)
+        # -------------------------------------------------------------------
+        units_display = meta.get("units") or meta.get("units_short") or "N/A"
+        frequency_display = meta.get("frequency") or meta.get("frequency_short") or "N/A"
+
         if not filtered_df.empty:
-            latest_row = filtered_df.iloc[-1]
-            first_row = filtered_df.iloc[0]
-            latest_val = latest_row["value"]
-            latest_date_str = latest_row["date"].strftime("%b %d, %Y")
+            start_date_actual = filtered_df["date"].min().strftime("%b %d, %Y")
+            end_date_actual = filtered_df["date"].max().strftime("%b %d, %Y")
+            date_range_label = f"{start_date_actual} to {end_date_actual}"
+        else:
+            date_range_label = "No observations in range"
 
-            diff_val = latest_val - first_row["value"]
-            pct_val = (diff_val / first_row["value"] * 100) if first_row["value"] != 0 else 0
-            min_val = filtered_df["value"].min()
-            max_val = filtered_df["value"].max()
-
-            m1, m2, m3, m4 = st.columns(4)
-            with m1:
-                st.metric("Latest Observation", f"{latest_val:,.2f}", delta=f"{latest_date_str}", delta_color="off")
-            with m2:
-                st.metric(f"Change ({time_frame})", f"{diff_val:+,.2f}", delta=f"{pct_val:+.2f}%")
-            with m3:
-                st.metric(f"Period High", f"{max_val:,.2f}")
-            with m4:
-                st.metric(f"Period Low", f"{min_val:,.2f}")
+        m1, m2, m3 = st.columns(3)
+        with m1:
+            st.metric("Units", units_display)
+        with m2:
+            st.metric("Frequency", frequency_display)
+        with m3:
+            st.metric("Time Horizon", time_frame, delta=date_range_label, delta_color="off")
 
         # Plotly Express Visualization
         fig = px.line(
@@ -533,6 +701,38 @@ def main():
         )
 
         st.plotly_chart(fig, width="stretch")
+
+        # -------------------------------------------------------------------
+        # Notes & Citation Section (directly beneath the series chart)
+        # -------------------------------------------------------------------
+        st.markdown("##### 📝 Notes")
+        raw_notes = meta.get("notes") if meta else ""
+        raw_citation = meta.get("citation") if meta else ""
+
+        # Sanitize notes and citation defensively in presentation layer
+        clean_notes = data_loader.clean_and_format_notes(raw_notes) if raw_notes else ""
+        clean_cit = data_loader.clean_citation(
+            raw_citation,
+            series_id=active_id,
+            title=meta.get("title") if meta else ""
+        )
+
+        has_content = bool(clean_notes or clean_cit)
+
+        if has_content:
+            total_chars = len(clean_notes) + len(clean_cit)
+            # Clean scrollable container for longer entries to prevent layout overwhelm
+            container_args = {"height": 240, "border": True} if total_chars > 300 else {"border": True}
+            with st.container(**container_args):
+                if clean_notes:
+                    st.markdown(clean_notes)
+                if clean_cit:
+                    if clean_notes:
+                        st.divider()
+                    st.markdown(f"**Suggested Citation:**\n\n{clean_cit}")
+        else:
+            with st.container(border=True):
+                st.caption("No descriptive notes available for this series.")
 
         # Raw Data Inspection Expander
         with st.expander("🔍 View Raw Observations & Download"):
