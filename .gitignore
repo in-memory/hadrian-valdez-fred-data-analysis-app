@@ -1,24 +1,49 @@
-# Environment variables and API keys
+# ==============================================================================
+# Environment & Secrets
+# ==============================================================================
 .env
+.streamlit/secrets.toml
 
-# Virtual environment folder
+# ==============================================================================
+# Virtual Environments
+# ==============================================================================
 .venv/
 venv/
 env/
 
-# Local Data downloads
-data
-
-# Python cache files
+# ==============================================================================
+# Python & Bytecode Cache
+# ==============================================================================
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 
-# OS-generated files
+# ==============================================================================
+# Testing, Linting & Type Checking Cache
+# ==============================================================================
+tests
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ==============================================================================
+# Jupyter & Interactive Notebooks
+# ==============================================================================
+.ipynb_checkpoints/
+
+# ==============================================================================
+# Local Data, Temporary Files & Caches
+# ==============================================================================
+data/
+fred_cache.json
+ignore_folder/
+
+# Local test runs/artifacts (keep commented out if you want to track your test files)
+# tests/
+
+# ==============================================================================
+# Operating System Artifacts
+# ==============================================================================
 .DS_Store
 Thumbs.db
-
-# Streamlit secrets (crucial if you deploy later)
-.streamlit/secrets.toml
-
-# Jupyter Notebook checkpoints (for your scratch notebook)
-.ipynb_checkpoints/
+Desktop.ini
