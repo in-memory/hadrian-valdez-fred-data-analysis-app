@@ -2,11 +2,12 @@ import glob
 import json
 import os
 import re
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from html import unescape
 import requests
-import pandas as pd
+import pandas as pd  # type: ignore[import-untyped]
 from dotenv import load_dotenv
 
 
@@ -232,8 +233,8 @@ def clean_and_format_notes(raw_text: str | None) -> str:
         flags=re.IGNORECASE | re.DOTALL
     )
 
-    # 2. Convert common block breaks (<br>, <p>, </p>, <div>, </div>) into newlines
-    text = re.sub(r'<(?:br\s*/?|/p|p|/div|div)[^>]*>', '\n\n', text, flags=re.IGNORECASE)
+    # 2. Convert common block breaks (<br>, <p>, <div>) into newlines
+    text = re.sub(r'<(?:br\s*/?|p|div)[^>]*>', '\n\n', text, flags=re.IGNORECASE)
 
     # 3. Format emphasis tags into Markdown
     text = re.sub(r'<strong[^>]*>(.*?)</strong>', r'**\1**', text, flags=re.IGNORECASE | re.DOTALL)
@@ -293,10 +294,11 @@ def fetch_series_web_details(series_id: str, timeout: int = 4) -> dict:
     - Extracts full un-truncated series notes (including opening definition paragraphs cut off in API).
     - Extracts the official 'Suggested Citation' block.
     """
-    url = f"https://fred.stlouisfed.org/series/{series_id.strip().upper()}"
+    clean_id = urllib.parse.quote(series_id.strip().upper(), safe="")
+    url = f"https://fred.stlouisfed.org/series/{clean_id}"
     req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0.0"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310
             html = resp.read().decode("utf-8", errors="replace")
     except Exception:
         return {}
@@ -447,8 +449,8 @@ def get_or_fetch_series_metadata(series_id: str) -> dict:
                 "citation": clean_citation("", series_id=series_id)
             }
             return fallback
-        except Exception:
-            pass
+        except (OSError, json.JSONDecodeError, KeyError) as e:
+            print(f"Warning: Failed to parse fallback JSON metadata for {series_id}: {e}")
 
     return {}
 

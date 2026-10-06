@@ -1,5 +1,5 @@
-import pandas as pd
-import plotly.express as px
+import pandas as pd  # type: ignore[import-untyped]
+import plotly.express as px  # type: ignore[import-untyped]
 import streamlit as st
 
 # Strictly import from category_manager and data_loader
@@ -205,11 +205,6 @@ def init_session_state() -> None:
     if "saved_datasets_select" not in st.session_state:
         active = st.session_state.active_series_id
         st.session_state.saved_datasets_select = active if active in cached else PLACEHOLDER_SAVED_DATASET
-
-    if "cached_series_dropdown_index" not in st.session_state:
-        active = st.session_state.active_series_id
-        st.session_state.cached_series_dropdown_index = (
-            cached.index(active) + 1) if active in cached else 0
 
     if "active_view" not in st.session_state:
         st.session_state.active_view = VIEW_EXPLORER
@@ -844,7 +839,7 @@ def _render_notes_and_citations(meta: dict, active_id: str) -> None:
     clean_cit = data_loader.clean_citation(
         raw_citation,
         series_id=active_id,
-        title=meta.get("title") if meta else ""
+        title=str(meta.get("title") or "") if meta else ""
     )
 
     has_content = bool(clean_notes or clean_cit)
