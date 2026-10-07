@@ -1,88 +1,284 @@
+from __future__ import annotations
+
 import json
+import logging
 import os
+import tempfile
+from typing import Any, NotRequired, TypedDict, cast
+
 import data_loader
 
 CACHE_FILE = "fred_cache.json"
 
+logger = logging.getLogger(__name__)
 
-def load_category_cache(cache_path: str = CACHE_FILE) -> dict:
+
+# ---------------------------------------------------------------------------
+# Strict Type Models (TypedDict)
+# ---------------------------------------------------------------------------
+
+class SeriesItem(TypedDict):
+    id: str
+    title: str
+    frequency: NotRequired[str | None]
+    units: NotRequired[str | None]
+    seasonal_adjustment: NotRequired[str | None]
+    last_updated: NotRequired[str | None]
+    observation_start: NotRequired[str | None]
+    observation_end: NotRequired[str | None]
+    popularity: NotRequired[int | float | None]
+
+
+class CategoryNode(TypedDict):
+    id: int
+    name: str
+    parent_id: int | None
+    children_ids: list[int] | None
+    series: list[SeriesItem] | None
+    total_series_count: NotRequired[int]
+
+
+class Breadcrumb(TypedDict):
+    id: int
+    name: str
+
+
+class ChildCategory(TypedDict):
+    id: int
+    name: str
+    parent_id: int | None
+
+
+class CacheStats(TypedDict):
+    total_categories: int
+    visited_categories: int
+    total_series_indexed: int
+
+
+class PaginatedSeriesResult(TypedDict):
+    total_count: int
+    page: int
+    page_size: int
+    total_pages: int
+    start_index: int
+    end_index: int
+    order_by: str
+    sort_order: str
+    series: list[SeriesItem]
+    is_fallback: bool
+
+
+# ---------------------------------------------------------------------------
+# Internal Helpers (Private)
+# ---------------------------------------------------------------------------
+
+def _get_or_create_node(
+    cache: dict[str, CategoryNode],
+    category_id: int,
+    name: str | None = None,
+    parent_id: int | None = None
+) -> CategoryNode:
+    """Retrieves an existing category node or initializes a structured stub node in cache."""
+    cat_key = str(category_id)
+    if cat_key in cache:
+        node = cache[cat_key]
+        if name and (not node.get("name") or node.get("name") == f"Category {category_id}"):
+            node["name"] = name
+        if parent_id is not None and node.get("parent_id") is None and category_id != 0:
+            node["parent_id"] = parent_id
+        return node
+
+    default_name = name or ("Categories" if category_id == 0 else f"Category {category_id}")
+    new_node: CategoryNode = {
+        "id": category_id,
+        "name": default_name,
+        "parent_id": None if category_id == 0 else parent_id,
+        "children_ids": None,
+        "series": [] if category_id == 0 else None
+    }
+    cache[cat_key] = new_node
+    return new_node
+
+
+def _merge_series_into_node(node: CategoryNode, new_series: list[SeriesItem]) -> None:
+    """Merges new series records into node['series'] by ID without clobbering existing records."""
+    existing_map: dict[str, SeriesItem] = {
+        str(s["id"]): s for s in (node.get("series") or []) if isinstance(s, dict) and "id" in s
+    }
+    for s in new_series:
+        if isinstance(s, dict) and "id" in s:
+            existing_map[str(s["id"])] = s
+    node["series"] = list(existing_map.values())
+
+
+def _sort_series(
+    series_list: list[SeriesItem],
+    order_by: str = "popularity",
+    sort_order: str = "desc"
+) -> list[SeriesItem]:
+    """Sorts a list of series dictionaries cleanly with graceful fallback for heterogeneous types."""
+    valid_order_by = {
+        "popularity", "last_updated", "observation_end", "observation_start",
+        "title", "frequency", "units", "seasonal_adjustment"
+    }
+    if order_by not in valid_order_by:
+        order_by = "popularity"
+
+    reverse = (sort_order.lower() == "desc")
+
+    def _sort_key(s: SeriesItem) -> Any:
+        val = cast(dict[str, Any], s).get(order_by)
+        if val is None:
+            return "" if order_by in ("title", "units", "frequency", "seasonal_adjustment") else 0
+        return val
+
+    try:
+        series_list.sort(key=_sort_key, reverse=reverse)
+    except TypeError:
+        series_list.sort(key=lambda s: str(cast(dict[str, Any], s).get(order_by, "") or ""), reverse=reverse)
+    return series_list
+
+
+def _paginate_series(
+    series_list: list[SeriesItem],
+    page: int,
+    page_size: int,
+    total_count: int | None = None,
+    order_by: str = "popularity",
+    sort_order: str = "desc",
+    is_fallback: bool = False
+) -> PaginatedSeriesResult:
+    """Builds the standardized paginated response envelope for series queries."""
+    if total_count is None:
+        total_count = len(series_list)
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        clamped_page = max(1, min(page, total_pages))
+        start_slice = (clamped_page - 1) * page_size
+        end_slice = clamped_page * page_size
+        slice_items = series_list[start_slice:end_slice]
+    else:
+        total_pages = max(1, (total_count + page_size - 1) // page_size)
+        clamped_page = page
+        slice_items = series_list
+
+    return {
+        "total_count": total_count,
+        "page": clamped_page,
+        "page_size": page_size,
+        "total_pages": total_pages,
+        "start_index": (clamped_page - 1) * page_size + 1 if total_count > 0 else 0,
+        "end_index": min(clamped_page * page_size, total_count),
+        "order_by": order_by,
+        "sort_order": sort_order,
+        "series": slice_items,
+        "is_fallback": is_fallback
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cache Persistence
+# ---------------------------------------------------------------------------
+
+def load_category_cache(cache_path: str = CACHE_FILE) -> dict[str, CategoryNode]:
+    """Loads and returns the category cache JSON from disk, or an empty dict on failure."""
     if os.path.exists(cache_path):
         try:
             with open(cache_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
-                    return data
-        except Exception as e:
-            print(
+                    return cast(dict[str, CategoryNode], data)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(
                 f"Error loading {cache_path}: {e}. Initializing empty cache.")
     return {}
 
 
-def save_category_cache(cache: dict, cache_path: str = CACHE_FILE) -> None:
+def save_category_cache(cache: dict[str, CategoryNode], cache_path: str = CACHE_FILE) -> None:
+    """Persists category cache to disk atomically using a secure temp file."""
+    dir_name = os.path.dirname(cache_path) or "."
+    temp_path: str | None = None
     try:
-        temp_path = f"{cache_path}.tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=dir_name,
+            encoding="utf-8",
+            delete=False,
+            prefix=f"{os.path.basename(cache_path)}.",
+            suffix=".tmp"
+        ) as f:
+            temp_path = f.name
             json.dump(cache, f, indent=2)
         os.replace(temp_path, cache_path)
-    except Exception as e:
-        print(f"Error saving {cache_path}: {e}")
+    except (OSError, TypeError) as e:
+        logger.error(f"Error saving {cache_path}: {e}")
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 
-def get_category_node(category_id: int, refresh: bool = False, cache_path: str = CACHE_FILE) -> dict | None:
-    cache = load_category_cache(cache_path)
+# ---------------------------------------------------------------------------
+# Hierarchy & Graph Management
+# ---------------------------------------------------------------------------
+
+def get_category_node(
+    category_id: int,
+    refresh: bool = False,
+    cache_path: str = CACHE_FILE,
+    _cache: dict[str, CategoryNode] | None = None
+) -> CategoryNode | None:
+    """
+    Retrieves category details, children, and top series from cache or fetches from FRED API.
+    Saves to disk only if modifications were made. Accepts optional in-memory `_cache` to avoid
+    redundant disk I/O.
+    """
+    cache = _cache if _cache is not None else load_category_cache(cache_path)
     cat_key = str(category_id)
+    dirty = False
 
     if cat_key not in cache or refresh:
         if category_id == 0:
             cat_info = data_loader.fetch_category_info(0)
             name = cat_info["name"] if cat_info else "Categories"
-            cache[cat_key] = {
-                "id": 0,
-                "name": name,
-                "parent_id": None,
-                "children_ids": None,
-                "series": None
-            }
+            node = _get_or_create_node(cache, 0, name=name, parent_id=None)
+            node["parent_id"] = None
+            if node.get("series") is None:
+                node["series"] = []
+            dirty = True
         else:
             cat_info = data_loader.fetch_category_info(category_id)
             if not cat_info:
                 return None
-            parent_id = cat_info.get("parent_id")
-            cache[cat_key] = {
-                "id": category_id,
-                "name": cat_info["name"],
-                "parent_id": parent_id if parent_id != 0 else None,
-                "children_ids": None,
-                "series": None
-            }
-
-    node = cache[cat_key]
+            raw_parent = cat_info.get("parent_id")
+            parent_id = raw_parent if raw_parent != 0 else None
+            node = _get_or_create_node(
+                cache, category_id, name=cat_info["name"], parent_id=parent_id)
+            node["parent_id"] = parent_id
+            dirty = True
+    else:
+        node = cache[cat_key]
 
     if node.get("children_ids") is None or refresh:
         children = data_loader.fetch_category_children(category_id)
         if children is not None:
-            child_ids = []
+            child_ids: list[int] = []
             for child in children:
-                cid = child["id"]
+                cid = int(child["id"])
                 child_ids.append(cid)
-                cid_key = str(cid)
-                if cid_key not in cache:
-                    cache[cid_key] = {
-                        "id": cid,
-                        "name": child["name"],
-                        "parent_id": category_id,
-                        "children_ids": None,
-                        "series": None
-                    }
-                else:
-                    cache[cid_key]["parent_id"] = category_id
+                child_node = _get_or_create_node(
+                    cache, cid, name=str(child["name"]), parent_id=category_id)
+                child_node["parent_id"] = category_id
             node["children_ids"] = child_ids
-        else:
+            dirty = True
+        elif node.get("children_ids") is None:
             node["children_ids"] = []
+            dirty = True
 
     if node.get("series") is None or refresh:
         if category_id == 0:
             node["series"] = []
+            dirty = True
         else:
             api_res = data_loader.fetch_category_series(category_id, limit=50)
             if api_res is not None:
@@ -90,8 +286,8 @@ def get_category_node(category_id: int, refresh: bool = False, cache_path: str =
                     api_res, dict) else api_res
                 node["series"] = [
                     {
-                        "id": s["id"],
-                        "title": s["title"],
+                        "id": str(s["id"]),
+                        "title": str(s["title"]),
                         "frequency": s.get("frequency"),
                         "units": s.get("units"),
                         "seasonal_adjustment": s.get("seasonal_adjustment"),
@@ -103,85 +299,103 @@ def get_category_node(category_id: int, refresh: bool = False, cache_path: str =
                     for s in series_list
                 ]
                 if isinstance(api_res, dict) and "count" in api_res:
-                    node["total_series_count"] = api_res["count"]
-            else:
+                    node["total_series_count"] = int(api_res["count"])
+                dirty = True
+            elif node.get("series") is None:
                 node["series"] = []
+                dirty = True
 
-    save_category_cache(cache, cache_path)
+    if dirty:
+        save_category_cache(cache, cache_path)
     return node
 
 
-def resolve_series_bottom_up(series_id: str, cache_path: str = CACHE_FILE) -> tuple[int | None, list[dict]]:
+def resolve_series_bottom_up(
+    series_id: str,
+    cache_path: str = CACHE_FILE
+) -> tuple[int | None, list[Breadcrumb]]:
+    """Resolves the category lineage for an arbitrary series ID bottom-up via cache or API."""
     series_id = series_id.strip().upper()
     cache = load_category_cache(cache_path)
 
     for node in cache.values():
-        if any(s.get("id", "").upper() == series_id for s in (node.get("series") or [])):
-            cat_id = node["id"]
-            return cat_id, get_breadcrumbs(cat_id, cache_path)
+        if isinstance(node, dict) and any(
+            s.get("id", "").upper() == series_id for s in (node.get("series") or []) if isinstance(s, dict)
+        ):
+            cat_id = int(node["id"])
+            return cat_id, get_breadcrumbs(cat_id, cache_path, _cache=cache)
 
     categories = data_loader.fetch_series_categories(series_id)
     if not categories:
         return None, []
 
     primary_cat = categories[0]
-    target_cat_id = primary_cat["id"]
-    target_name = primary_cat["name"]
+    target_cat_id = int(primary_cat["id"])
+    target_name = str(primary_cat["name"])
     target_parent = primary_cat.get("parent_id")
+    target_parent_clean = None if target_cat_id == 0 else (
+        int(target_parent) if target_parent is not None else None)
 
-    target_key = str(target_cat_id)
-    if target_key not in cache:
-        cache[target_key] = {
-            "id": target_cat_id,
-            "name": target_name,
-            "parent_id": None if target_cat_id == 0 else target_parent,
-            "children_ids": None,
-            "series": []
-        }
+    target_node = _get_or_create_node(
+        cache, target_cat_id, name=target_name, parent_id=target_parent_clean)
+    if target_node.get("series") is None:
+        target_node["series"] = []
 
-    if not any(s["id"].upper() == series_id for s in (cache[target_key].get("series") or [])):
-        cache[target_key].setdefault("series", []).append({
+    if not any(s.get("id", "").upper() == series_id for s in (target_node.get("series") or []) if isinstance(s, dict)):
+        stub_series: SeriesItem = {
             "id": series_id,
             "title": series_id,
             "frequency": None,
             "units": None
-        })
+        }
+        if target_node.get("series") is None:
+            target_node["series"] = []
+        target_series = target_node["series"]
+        if target_series is not None:
+            target_series.append(stub_series)
 
-    curr_id = target_parent
-    visited = set()
+    curr_id = target_parent_clean
+    visited: set[int] = set()
     while curr_id is not None and curr_id != 0 and curr_id not in visited:
         visited.add(curr_id)
         curr_key = str(curr_id)
         if curr_key in cache:
-            curr_id = cache[curr_key].get("parent_id")
+            parent_raw = cache[curr_key].get("parent_id")
+            curr_id = int(parent_raw) if parent_raw is not None else None
         else:
             parent_info = data_loader.fetch_category_info(curr_id)
             if parent_info:
                 p_parent = parent_info.get("parent_id")
-                cache[curr_key] = {
-                    "id": curr_id,
-                    "name": parent_info["name"],
-                    "parent_id": None if curr_id == 0 else p_parent,
-                    "children_ids": None,
-                    "series": None
-                }
-                curr_id = p_parent
+                clean_parent = None if curr_id == 0 else (
+                    int(p_parent) if p_parent is not None else None)
+                _get_or_create_node(
+                    cache, curr_id, name=str(parent_info["name"]), parent_id=clean_parent)
+                curr_id = clean_parent
             else:
                 break
 
-    if "0" not in cache:
-        cache["0"] = {"id": 0, "name": "Categories",
-                      "parent_id": None, "children_ids": None, "series": []}
+    # Ensure root category (0) is present in cache
+    root_node = _get_or_create_node(cache, 0, name="Categories", parent_id=None)
+    assert root_node is not None
 
     save_category_cache(cache, cache_path)
-    return target_cat_id, get_breadcrumbs(target_cat_id, cache_path)
+    return target_cat_id, get_breadcrumbs(target_cat_id, cache_path, _cache=cache)
 
 
-def get_breadcrumbs(category_id: int, cache_path: str = CACHE_FILE) -> list[dict]:
-    cache = load_category_cache(cache_path)
-    crumbs = []
-    curr_id = category_id
-    visited = set()
+def get_breadcrumbs(
+    category_id: int,
+    cache_path: str = CACHE_FILE,
+    _cache: dict[str, CategoryNode] | None = None
+) -> list[Breadcrumb]:
+    """
+    Constructs the breadcrumb lineage list from Root (0) down to the given category.
+    Accepts an optional in-memory `_cache` dict to avoid redundant disk I/O.
+    """
+    cache = _cache if _cache is not None else load_category_cache(cache_path)
+    crumbs: list[Breadcrumb] = []
+    curr_id: int | None = category_id
+    visited: set[int] = set()
+    dirty = False
 
     while curr_id is not None and curr_id not in visited:
         visited.add(curr_id)
@@ -192,50 +406,72 @@ def get_breadcrumbs(category_id: int, cache_path: str = CACHE_FILE) -> list[dict
             parent_id = node.get("parent_id")
             if curr_id == 0 or parent_id == curr_id or parent_id is None:
                 break
-            curr_id = parent_id
+            curr_id = int(parent_id)
         else:
             info = data_loader.fetch_category_info(curr_id)
             if info:
-                crumbs.append({"id": info["id"], "name": info["name"]})
+                crumbs.append({"id": int(info["id"]), "name": str(info["name"])})
                 parent_id = info.get("parent_id")
+                clean_parent = None if curr_id == 0 else (
+                    int(parent_id) if parent_id is not None else None)
+                _get_or_create_node(
+                    cache, curr_id, name=str(info["name"]), parent_id=clean_parent)
+                dirty = True
                 if curr_id == 0 or parent_id == curr_id or parent_id is None:
                     break
-                curr_id = parent_id
+                curr_id = clean_parent
             else:
                 crumbs.append({"id": curr_id, "name": f"Category {curr_id}"})
                 break
 
     crumbs.reverse()
     if not crumbs or crumbs[0]["id"] != 0:
-        root_name = cache.get("0", {}).get("name", "Root")
+        root_node = cache.get("0")
+        root_name = root_node["name"] if root_node else "Categories"
         crumbs.insert(0, {"id": 0, "name": root_name})
+
+    if dirty:
+        save_category_cache(cache, cache_path)
 
     return crumbs
 
 
-def get_child_categories(category_id: int, cache_path: str = CACHE_FILE) -> list[dict]:
-    node = get_category_node(category_id, cache_path=cache_path)
+def get_child_categories(
+    category_id: int,
+    cache_path: str = CACHE_FILE
+) -> list[ChildCategory]:
+    """Retrieves immediate subcategory objects with id, name, and parent_id for the given category."""
+    cache = load_category_cache(cache_path)
+    node = get_category_node(category_id, cache_path=cache_path, _cache=cache)
     if not node:
         return []
 
     child_ids = node.get("children_ids") or []
-    cache = load_category_cache(cache_path)
-    return [
-        {
-            "id": cache[str(cid)]["id"] if str(cid) in cache else cid,
-            "name": cache[str(cid)]["name"] if str(cid) in cache else f"Category {cid}",
-            "parent_id": cache[str(cid)].get("parent_id") if str(cid) in cache else category_id
-        }
-        for cid in child_ids
-    ]
+    if not child_ids:
+        return []
+
+    result: list[ChildCategory] = []
+    for cid in child_ids:
+        child_node = cache.get(str(cid))
+        result.append({
+            "id": child_node["id"] if child_node else cid,
+            "name": child_node["name"] if child_node else f"Category {cid}",
+            "parent_id": child_node.get("parent_id") if child_node else category_id
+        })
+    return result
 
 
-def get_cache_stats(cache_path: str = CACHE_FILE) -> dict:
+def get_cache_stats(cache_path: str = CACHE_FILE) -> CacheStats:
+    """Returns high-level graph and category metadata statistics from local cache."""
     cache = load_category_cache(cache_path)
     return {
         "total_categories": len(cache),
-        "visited_categories": sum(1 for n in cache.values() if n.get("children_ids") is not None),
-        "total_series_indexed": sum(len(n.get("series") or []) for n in cache.values())
+        "visited_categories": sum(
+            1 for n in cache.values() if isinstance(n, dict) and n.get("children_ids") is not None
+        ),
+        "total_series_indexed": sum(
+            len(n.get("series") or []) for n in cache.values() if isinstance(n, dict)
+        )
     }
 
 
@@ -247,9 +483,13 @@ def get_category_series_paginated(
     sort_order: str = "desc",
     filter_text: str = "",
     cache_path: str = CACHE_FILE
-) -> dict:
+) -> PaginatedSeriesResult:
+    """
+    Returns a paginated slice of series under category_id with support for ordering,
+    text filtering, and offline local cache fallback.
+    """
     page = max(1, int(page))
-    page_size = 50
+    page_size = max(1, int(page_size))
     valid_order_by = {
         "popularity", "last_updated", "observation_end", "observation_start",
         "title", "frequency", "units", "seasonal_adjustment"
@@ -260,11 +500,15 @@ def get_category_series_paginated(
     sort_order = sort_order.lower() if sort_order in ("asc", "desc") else "desc"
 
     if category_id == 0:
-        return {
-            "total_count": 0, "page": 1, "page_size": page_size, "total_pages": 1,
-            "start_index": 0, "end_index": 0, "order_by": order_by,
-            "sort_order": sort_order, "series": [], "is_fallback": False
-        }
+        return _paginate_series(
+            series_list=[],
+            page=1,
+            page_size=page_size,
+            total_count=0,
+            order_by=order_by,
+            sort_order=sort_order,
+            is_fallback=False
+        )
 
     filter_text = (filter_text or "").strip().lower()
 
@@ -273,50 +517,34 @@ def get_category_series_paginated(
         cat_key = str(category_id)
         node = cache.get(cat_key)
 
-        if not node or not node.get("series") or (len(node.get("series", [])) < 50 and node.get("total_series_count", 0) > len(node.get("series", []))):
-            fetch_res = data_loader.fetch_category_series(
-                category_id, limit=1000, offset=0, order_by=order_by, sort_order=sort_order)
-            if fetch_res and "series" in fetch_res:
-                if not node:
-                    node = {"id": category_id, "name": f"Category {category_id}",
-                            "parent_id": None, "children_ids": None, "series": []}
-                    cache[cat_key] = node
-                node["series"] = fetch_res["series"]
-                node["total_series_count"] = fetch_res.get(
-                    "count", len(fetch_res["series"]))
-                save_category_cache(cache, cache_path)
+        fetch_res = data_loader.fetch_category_series(
+            category_id, limit=1000, offset=0, order_by=order_by, sort_order=sort_order)
+        if fetch_res and "series" in fetch_res:
+            if not node:
+                node = _get_or_create_node(cache, category_id)
+            _merge_series_into_node(node, cast(list[SeriesItem], fetch_res["series"]))
+            node["total_series_count"] = int(fetch_res.get("count", len(node["series"] or [])))
+            save_category_cache(cache, cache_path)
+            is_fallback = False
+        else:
+            is_fallback = True
 
-        all_series = list((node.get("series") if node else []) or [])
-        filtered = [s for s in all_series if filter_text in s.get(
-            "id", "").lower() or filter_text in s.get("title", "").lower()]
+        all_series: list[SeriesItem] = list((node.get("series") if node else []) or [])
+        filtered = [
+            s for s in all_series
+            if filter_text in str(s.get("id", "")).lower() or filter_text in str(s.get("title", "")).lower()
+        ]
+        _sort_series(filtered, order_by=order_by, sort_order=sort_order)
+        return _paginate_series(
+            series_list=filtered,
+            page=page,
+            page_size=page_size,
+            order_by=order_by,
+            sort_order=sort_order,
+            is_fallback=is_fallback
+        )
 
-        def sort_key_filter(s):
-            val = s.get(order_by)
-            return ("" if order_by in ("title", "units", "frequency", "seasonal_adjustment") else 0) if val is None else val
-
-        try:
-            filtered.sort(key=sort_key_filter, reverse=(sort_order == "desc"))
-        except TypeError:
-            filtered.sort(key=lambda s: str(s.get(order_by, "")),
-                          reverse=(sort_order == "desc"))
-
-        total_count = len(filtered)
-        total_pages = max(1, (total_count + page_size - 1) // page_size)
-        clamped_page = max(1, min(page, total_pages))
-
-        return {
-            "total_count": total_count,
-            "page": clamped_page,
-            "page_size": page_size,
-            "total_pages": total_pages,
-            "start_index": (clamped_page - 1) * page_size + 1 if total_count > 0 else 0,
-            "end_index": min(clamped_page * page_size, total_count),
-            "order_by": order_by,
-            "sort_order": sort_order,
-            "series": filtered[(clamped_page - 1) * page_size: clamped_page * page_size],
-            "is_fallback": False
-        }
-
+    # Empty filter_text: paginated API fetch with local cache update
     offset = (page - 1) * page_size
     api_res = data_loader.fetch_category_series(
         category_id=category_id, limit=page_size, offset=offset, order_by=order_by, sort_order=sort_order)
@@ -325,8 +553,8 @@ def get_category_series_paginated(
     node = cache.get(cat_key)
 
     if api_res is not None:
-        total_count = api_res.get("count", 0)
-        series_items = api_res.get("series", [])
+        total_count = int(api_res.get("count", 0))
+        series_items: list[SeriesItem] = list(api_res.get("series", []))
         total_pages = max(1, (total_count + page_size - 1) // page_size)
 
         if page > total_pages and total_count > 0:
@@ -334,59 +562,33 @@ def get_category_series_paginated(
             offset = (page - 1) * page_size
             api_res = data_loader.fetch_category_series(
                 category_id=category_id, limit=page_size, offset=offset, order_by=order_by, sort_order=sort_order)
-            series_items = api_res.get(
-                "series", []) if api_res else series_items
+            series_items = list(api_res.get("series", [])) if api_res else series_items
 
         if node is None:
-            node = {"id": category_id, "name": f"Category {category_id}",
-                    "parent_id": None, "children_ids": None, "series": []}
-            cache[cat_key] = node
+            node = _get_or_create_node(cache, category_id)
 
         node["total_series_count"] = total_count
-        existing_map = {s["id"]: s for s in (node.get("series") or [])}
-        for s in series_items:
-            existing_map[s["id"]] = s
-        node["series"] = list(existing_map.values())
+        _merge_series_into_node(node, series_items)
         save_category_cache(cache, cache_path)
 
-        return {
-            "total_count": total_count,
-            "page": page,
-            "page_size": page_size,
-            "total_pages": total_pages,
-            "start_index": (page - 1) * page_size + 1 if total_count > 0 else 0,
-            "end_index": min(page * page_size, total_count),
-            "order_by": order_by,
-            "sort_order": sort_order,
-            "series": series_items,
-            "is_fallback": False
-        }
+        return _paginate_series(
+            series_list=series_items,
+            page=page,
+            page_size=page_size,
+            total_count=total_count,
+            order_by=order_by,
+            sort_order=sort_order,
+            is_fallback=False
+        )
 
-    cached_series = list((node.get("series") if node else []) or [])
-
-    def sort_key_cached(s):
-        val = s.get(order_by)
-        return ("" if order_by in ("title", "units", "frequency", "seasonal_adjustment") else 0) if val is None else val
-
-    try:
-        cached_series.sort(key=sort_key_cached, reverse=(sort_order == "desc"))
-    except TypeError:
-        cached_series.sort(key=lambda s: str(
-            s.get(order_by, "")), reverse=(sort_order == "desc"))
-
-    total_count = len(cached_series)
-    total_pages = max(1, (total_count + page_size - 1) // page_size)
-    clamped_page = max(1, min(page, total_pages))
-
-    return {
-        "total_count": total_count,
-        "page": clamped_page,
-        "page_size": page_size,
-        "total_pages": total_pages,
-        "start_index": (clamped_page - 1) * page_size + 1 if total_count > 0 else 0,
-        "end_index": min(clamped_page * page_size, total_count),
-        "order_by": order_by,
-        "sort_order": sort_order,
-        "series": cached_series[(clamped_page - 1) * page_size: clamped_page * page_size],
-        "is_fallback": True
-    }
+    # Offline fallback path when network/API call fails
+    cached_series: list[SeriesItem] = list((node.get("series") if node else []) or [])
+    _sort_series(cached_series, order_by=order_by, sort_order=sort_order)
+    return _paginate_series(
+        series_list=cached_series,
+        page=page,
+        page_size=page_size,
+        order_by=order_by,
+        sort_order=sort_order,
+        is_fallback=True
+    )

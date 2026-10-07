@@ -1,3 +1,5 @@
+from typing import Any
+
 import pandas as pd  # type: ignore[import-untyped]
 import plotly.express as px  # type: ignore[import-untyped]
 import streamlit as st
@@ -6,6 +8,7 @@ import streamlit as st
 # dashboard.py must NOT directly call the FRED API or read/write cache files
 import category_manager
 import data_loader
+from category_manager import SeriesItem
 
 # ---------------------------------------------------------------------------
 # Page Configuration & Styling
@@ -270,6 +273,8 @@ def navigate_to_category(new_cat_id: int) -> None:
         st.session_state.forward_stack = []
         st.session_state.current_category_id = new_cat_id
         st.session_state.series_search_filter = ""
+        st.session_state.series_filter_input = ""
+        st.session_state.last_filter_query = ""
         st.rerun()
 
 
@@ -281,6 +286,8 @@ def navigate_back() -> None:
             st.session_state.current_category_id)
         st.session_state.current_category_id = prev_id
         st.session_state.series_search_filter = ""
+        st.session_state.series_filter_input = ""
+        st.session_state.last_filter_query = ""
         st.rerun()
 
 
@@ -292,6 +299,8 @@ def navigate_forward() -> None:
             st.session_state.current_category_id)
         st.session_state.current_category_id = next_id
         st.session_state.series_search_filter = ""
+        st.session_state.series_filter_input = ""
+        st.session_state.last_filter_query = ""
         st.rerun()
 
 
@@ -345,7 +354,7 @@ def _render_sidebar_direct_search() -> None:
                     st.warning(
                         f"Could not map '{search_input}' to a category, but loaded as active series.")
                     st.rerun()
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 st.error(f"Error resolving series: {e}")
 
 
@@ -389,6 +398,10 @@ def _render_sidebar_storage_stats() -> None:
     if st.button("🔄 Refresh Current Category", width="stretch"):
         category_manager.get_category_node(
             st.session_state.current_category_id, refresh=True)
+        st.session_state.category_page = 1
+        st.session_state.series_filter_input = ""
+        st.session_state.series_search_filter = ""
+        st.session_state.last_filter_query = ""
         st.toast("Refreshed category cache from FRED API!", icon="✅")
         st.rerun()
 
@@ -627,7 +640,7 @@ def _render_category_series_section(curr_id: int, cat_name: str) -> None:
                 "No series directly associated with this category. Please check its subcategories.")
 
 
-def _render_series_item_row(s: dict, current_page: int) -> None:
+def _render_series_item_row(s: SeriesItem, current_page: int) -> None:
     """Renders a single series record row with metadata pills, chart trigger, and FRED link."""
     s_id = s["id"]
     s_title = s["title"]
@@ -761,7 +774,7 @@ def _render_visualizer_controls(active_id: str, cache_badge: str, obs_count: int
         else:
             time_frame = st.session_state.time_horizon
 
-    return time_frame
+    return str(time_frame)
 
 
 def _filter_by_time_horizon(df: pd.DataFrame, time_frame: str) -> pd.DataFrame:
@@ -779,7 +792,7 @@ def _filter_by_time_horizon(df: pd.DataFrame, time_frame: str) -> pd.DataFrame:
     return df[df["date"] >= start_date].copy()
 
 
-def _render_summary_metrics(filtered_df: pd.DataFrame, meta: dict, time_frame: str) -> None:
+def _render_summary_metrics(filtered_df: pd.DataFrame, meta: dict[str, Any], time_frame: str) -> None:
     """Renders 3-column summary metrics for units, frequency, and date span."""
     units_display = meta.get("units") or meta.get("units_short") or "N/A"
     frequency_display = meta.get("frequency") or meta.get(
@@ -813,14 +826,14 @@ def _render_timeseries_chart(filtered_df: pd.DataFrame, active_id: str, time_fra
         template="plotly_dark"
     )
     fig.update_traces(
-        line=dict(color="#38bdf8", width=2.5),
+        line={"color": "#38bdf8", "width": 2.5},
         hovertemplate="<b>Date:</b> %{x|%Y-%m-%d}<br><b>Value:</b> %{y:,.2f}<extra></extra>"
     )
     fig.update_layout(
         hovermode="x unified",
-        margin=dict(l=20, r=20, t=50, b=20),
-        xaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.08)"),
-        yaxis=dict(showgrid=True, gridcolor="rgba(255,255,255,0.08)"),
+        margin={"l": 20, "r": 20, "t": 50, "b": 20},
+        xaxis={"showgrid": True, "gridcolor": "rgba(255,255,255,0.08)"},
+        yaxis={"showgrid": True, "gridcolor": "rgba(255,255,255,0.08)"},
         plot_bgcolor="rgba(0,0,0,0)",
         paper_bgcolor="rgba(0,0,0,0)"
     )
@@ -828,7 +841,7 @@ def _render_timeseries_chart(filtered_df: pd.DataFrame, active_id: str, time_fra
     st.plotly_chart(fig, width="stretch")
 
 
-def _render_notes_and_citations(meta: dict, active_id: str) -> None:
+def _render_notes_and_citations(meta: dict[str, Any], active_id: str) -> None:
     """Renders the sanitized notes and suggested citation in a scrollable container."""
     st.markdown("##### 📝 Notes")
     raw_notes = meta.get("notes") if meta else ""
